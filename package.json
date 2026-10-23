@@ -1,0 +1,25 @@
+{
+  "name": "transub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Transub 译流 — 浏览器实时双语字幕扩展（本地 Whisper + 自有 AI 翻译）",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "3.8.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.6",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "^5.7.3",
+    "vite": "6.4.5"
+  }
+}
