@@ -838,6 +838,8 @@ function AsrSection({ settings, update }: SectionProps) {
       Object.assign(draft.asr, values);
     }, immediate);
   };
+  const selectedModel =
+    WHISPER_MODELS.find((model) => model.id === asr.localModel) ?? WHISPER_MODELS[0];
 
   const languageSelect = (
     <label className="field">
@@ -929,7 +931,11 @@ function AsrSection({ settings, update }: SectionProps) {
                 >
                   <span className="model-name">
                     {model.label}
-                    {model.id === 'base' ? <span className="tag">均衡</span> : null}
+                    {model.badge ? (
+                      <span className={`tag ${model.badge === '实验' ? 'warn' : ''}`}>
+                        {model.badge}
+                      </span>
+                    ) : null}
                   </span>
                   <span className="model-meta">
                     {model.params} 参数 · {model.download}
@@ -939,6 +945,16 @@ function AsrSection({ settings, update }: SectionProps) {
                 </button>
               ))}
             </div>
+
+            {selectedModel.requirements ? (
+              <div className="callout warn">
+                <InfoIcon size={15} />
+                <span>
+                  <strong>{selectedModel.label} 属于高负载档位。</strong>{' '}
+                  {selectedModel.requirements}
+                </span>
+              </div>
+            ) : null}
 
             <div className="asr-form-grid">
               <div className="field">
@@ -962,12 +978,12 @@ function AsrSection({ settings, update }: SectionProps) {
                   value={asr.modelHost}
                   ariaLabel="模型下载源"
                   options={[
-                    { value: 'huggingface', label: 'Hugging Face' },
                     { value: 'hf-mirror', label: '国内镜像' },
+                    { value: 'huggingface', label: 'Hugging Face' },
                   ]}
                   onChange={(value) => patch({ modelHost: value }, true)}
                 />
-                <span className="field-hint">无法访问 Hugging Face 时切换到 hf-mirror。</span>
+                <span className="field-hint">默认使用国内镜像；有稳定国际网络或镜像不可用时切换到 Hugging Face。</span>
               </div>
             </div>
 
@@ -976,7 +992,7 @@ function AsrSection({ settings, update }: SectionProps) {
             <div className="callout">
               <InfoIcon size={15} />
               <span>
-                首次识别时会下载并缓存模型（Tiny 约 40–75 MB）。下载期间请保持页面打开；模型会保存在浏览器缓存中，下次秒开。
+                首次识别时会下载并缓存模型（{selectedModel.label} {selectedModel.download}）。下载期间请保持页面打开；缓存后无需重新下载，但每次开始字幕仍需要加载和初始化模型。
               </span>
             </div>
           </section>

@@ -31,7 +31,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     engine: 'local',
     localModel: 'tiny',
     localDevice: 'auto',
-    modelHost: 'huggingface',
+    modelHost: 'hf-mirror',
     language: 'auto',
     remoteBaseUrl: 'https://api.openai.com/v1',
     remoteApiKey: '',
@@ -92,13 +92,15 @@ function normalizeAsr(raw: unknown): AsrSettings {
   const value = (raw && typeof raw === 'object' ? raw : {}) as Partial<AsrSettings>;
   return {
     engine: value.engine === 'remote' ? 'remote' : 'local',
-    localModel: ['tiny', 'base', 'small'].includes(value.localModel || '')
+    localModel: ['tiny', 'base', 'small', 'medium', 'large-v3-turbo'].includes(
+      value.localModel || '',
+    )
       ? (value.localModel as AsrSettings['localModel'])
       : 'tiny',
     localDevice: ['auto', 'webgpu', 'wasm'].includes(value.localDevice || '')
       ? (value.localDevice as AsrSettings['localDevice'])
       : 'auto',
-    modelHost: value.modelHost === 'hf-mirror' ? 'hf-mirror' : 'huggingface',
+    modelHost: value.modelHost === 'huggingface' ? 'huggingface' : 'hf-mirror',
     language: asString(value.language, 'auto'),
     remoteBaseUrl: asString(value.remoteBaseUrl, 'https://api.openai.com/v1'),
     remoteApiKey: asString(value.remoteApiKey, ''),

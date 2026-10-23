@@ -911,6 +911,12 @@ body {
   letter-spacing: 0.04em;
 }
 
+.tag.warn {
+  border-color: rgba(244, 198, 107, 0.24);
+  background: rgba(244, 198, 107, 0.08);
+  color: var(--amber);
+}
+
 .asr-form-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

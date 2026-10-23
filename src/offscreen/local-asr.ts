@@ -86,12 +86,17 @@ export class LocalWhisper {
       }
     };
 
+    const heavy =
+      asr.localModel === 'medium' || asr.localModel === 'large-v3-turbo';
     const create = async (
       device: 'webgpu' | 'wasm',
     ): Promise<AutomaticSpeechRecognitionPipeline> => {
+      // 重型模型的 fp32 编码器可达 1–3 GB，WebGPU 改用 q4 控制显存和下载体积。
       const dtype =
         device === 'webgpu'
-          ? { encoder_model: 'fp32', decoder_model_merged: 'q4' }
+          ? heavy
+            ? { encoder_model: 'q4', decoder_model_merged: 'q4' }
+            : { encoder_model: 'fp32', decoder_model_merged: 'q4' }
           : 'q8';
       const pipe = await pipeline('automatic-speech-recognition', modelId, {
         device,

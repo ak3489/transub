@@ -82,7 +82,7 @@ async function prepareModel(): Promise<void> {
   } catch (error) {
     if (!active) return;
     fatal = true;
-    const message = `本地模型加载失败：${describeError(error)}。可在设置中切换模型镜像，或改用远程 ASR。`;
+    const message = `本地模型加载失败：${describeError(error)}。可在设置中切换模型镜像、换回更小的模型，或改用远程 ASR。`;
     emitStatus({ phase: 'error', message }, true);
     if (tabId != null && sessionId != null) {
       post({ type: 'ASR_ERROR', tabId, sessionId, message, fatal: true });
@@ -133,7 +133,7 @@ async function drainQueue(): Promise<void> {
         } catch (error) {
           if (!active) return;
           fatal = true;
-          const message = `本地模型加载失败：${describeError(error)}。可在设置中切换模型镜像，或改用远程 ASR。`;
+          const message = `本地模型加载失败：${describeError(error)}。可在设置中切换模型镜像、换回更小的模型，或改用远程 ASR。`;
           emitStatus({ phase: 'error', message }, true);
           if (tabId != null && sessionId != null) {
             post({ type: 'ASR_ERROR', tabId, sessionId, message, fatal: true });

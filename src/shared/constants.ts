@@ -1,3 +1,5 @@
+import type { LocalWhisperModel } from './types';
+
 export const APP_NAME = 'Transub 译流';
 export const SETTINGS_KEY = 'settings';
 export const SESSION_KEY = 'currentSession';
@@ -30,27 +32,58 @@ export const TARGET_LANGUAGES = [
   { code: 'custom', label: '自定义…' },
 ];
 
-export const WHISPER_MODELS = [
+export interface WhisperModelOption {
+  id: LocalWhisperModel;
+  label: string;
+  params: string;
+  download: string;
+  description: string;
+  badge?: string;
+  requirements?: string;
+}
+
+export const WHISPER_MODELS: WhisperModelOption[] = [
   {
-    id: 'tiny' as const,
+    id: 'tiny',
     label: 'Tiny',
     params: '39M',
     download: '约 40–75 MB',
     description: '最快，适合实时字幕；复杂场景准确率一般',
   },
   {
-    id: 'base' as const,
+    id: 'base',
     label: 'Base',
     params: '74M',
     download: '约 80–150 MB',
     description: '速度与准确率平衡，推荐日常使用',
+    badge: '均衡',
   },
   {
-    id: 'small' as const,
+    id: 'small',
     label: 'Small',
     params: '244M',
     download: '约 250–500 MB',
     description: '更准确，但需要更强的 CPU / GPU',
+  },
+  {
+    id: 'medium',
+    label: 'Medium',
+    params: '769M',
+    download: '约 0.7–0.8 GB',
+    description: '明显更准，但推理明显变慢；普通电脑可能无法实时',
+    badge: '重型',
+    requirements:
+      '建议 16 GB 内存、支持 WebGPU 且显存 4 GB 以上的显卡，并预留约 1.5 GB 磁盘缓存。WASM 模式通常无法实时；配置不足时请继续使用 Small。',
+  },
+  {
+    id: 'large-v3-turbo',
+    label: 'Large Turbo',
+    params: '809M',
+    download: '约 0.8–1.1 GB',
+    description: '本地最高档，准确率最好；实验性，对显卡要求很高',
+    badge: '实验',
+    requirements:
+      '建议 16–32 GB 内存、WebGPU 独立显卡 8 GB 以上显存，并预留约 2 GB 磁盘缓存。低配设备可能加载失败、卡死或严重掉帧；WASM 模式不推荐。',
   },
 ];
 
@@ -58,6 +91,8 @@ export const WHISPER_REPOS: Record<string, string> = {
   tiny: 'onnx-community/whisper-tiny',
   base: 'onnx-community/whisper-base',
   small: 'onnx-community/whisper-small',
+  medium: 'Xenova/whisper-medium',
+  'large-v3-turbo': 'onnx-community/whisper-large-v3-turbo',
 };
 
 export interface ProviderPreset {

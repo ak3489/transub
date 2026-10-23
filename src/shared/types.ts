@@ -10,7 +10,7 @@ export interface AiProfile {
 }
 
 export type AsrEngine = 'local' | 'remote';
-export type LocalWhisperModel = 'tiny' | 'base' | 'small';
+export type LocalWhisperModel = 'tiny' | 'base' | 'small' | 'medium' | 'large-v3-turbo';
 export type InferenceDevice = 'auto' | 'webgpu' | 'wasm';
 export type ModelHost = 'huggingface' | 'hf-mirror';
 
