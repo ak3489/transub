@@ -79,11 +79,26 @@ export interface SessionStatus {
 
 export type SegmentState = 'pending' | 'translating' | 'done' | 'error';
 
+/** 视频播放位置采样：把捕获时间轴映射回原视频的媒体时间 */
+export interface VideoAnchor {
+  /** 采样时的墙钟时间（ms） */
+  at: number;
+  /** 采样时视频的 currentTime（秒） */
+  videoTime: number;
+  paused: boolean;
+  rate: number;
+  /** 由 seek 后的位置触发，表示此处播放位置发生跳变 */
+  seek?: boolean;
+}
+
 export interface CaptionSegment {
   id: string;
   /** 相对捕获开始的秒数 */
   start: number;
   end: number;
+  /** 映射到视频时间轴的秒数；缺少时回退到 baseTime + start */
+  mediaStart?: number;
+  mediaEnd?: number;
   original: string;
   translation: string;
   status: SegmentState;
@@ -95,15 +110,19 @@ export interface SessionSnapshot {
   startedAt: number;
   active: boolean;
   title: string;
-  /** 开始捕获时视频的 currentTime，导出时用于对齐原视频时间轴 */
+  /** 首次捕获到的视频 currentTime，旧会话导出时的回退基准 */
   baseTime: number;
   baseTimeSet: boolean;
+  /** 音频时间轴零点对应的墙钟时间（ms） */
+  captureEpoch: number;
+  /** 按时间排序的视频位置采样 */
+  anchors: VideoAnchor[];
   status: SessionStatus;
   segments: CaptionSegment[];
   asrEngine: AsrEngine;
 }
 
-export interface SessionView extends Omit<SessionSnapshot, 'segments'> {
+export interface SessionView extends Omit<SessionSnapshot, 'segments' | 'anchors'> {
   segments: CaptionSegment[];
   segmentCount: number;
   latestSegment: CaptionSegment | null;
@@ -145,8 +164,23 @@ export type BackgroundRequest =
   | { type: 'SET_ACTIVE_PROFILE'; profileId: string }
   | { type: 'OPEN_OPTIONS' }
   | { type: 'CONTENT_READY' }
-  | { type: 'VIDEO_ANCHOR'; videoTime: number }
+  | {
+      type: 'VIDEO_ANCHOR';
+      videoTime: number;
+      at?: number;
+      paused?: boolean;
+      rate?: number;
+      seek?: boolean;
+    }
+  | { type: 'GET_REPLAY_CUES'; tabId?: number }
   | { type: 'STOP_SESSION' };
+
+export interface ReplayCuesResponse {
+  ok: boolean;
+  tabId: number;
+  baseTime: number;
+  segments: CaptionSegment[];
+}
 
 export type ContentEvent =
   | {
@@ -172,7 +206,13 @@ export type OffscreenRequest =
   | { to: 'offscreen'; type: 'PING' };
 
 export type OffscreenEvent =
-  | { type: 'CAPTURE_STARTED'; tabId: number; sessionId: number }
+  | {
+      type: 'CAPTURE_STARTED';
+      tabId: number;
+      sessionId: number;
+      /** 音频时间轴零点附近的墙钟时间（ms） */
+      capturedAt?: number;
+    }
   | {
       type: 'CAPTURE_ENDED';
       tabId: number;

@@ -1,9 +1,11 @@
 import { DEFAULT_SETTINGS, loadSettings, onSettingsChanged, patchOverlay } from '../shared/settings';
+import { segmentRange } from '../shared/timeline';
 import type {
   AppSettings,
   CaptionSegment,
   ContentEvent,
   OverlaySettings,
+  ReplayCuesResponse,
   SessionStatus,
   StateResponse,
 } from '../shared/types';
@@ -234,6 +236,7 @@ class SubtitleOverlay {
   private translationEl: HTMLElement;
   private overlay: OverlaySettings;
   private active = false;
+  private replay = false;
   private status: SessionStatus = { phase: 'idle', message: '' };
   private current: CaptionSegment | null = null;
   private hideTimer: number | null = null;
@@ -438,6 +441,10 @@ class SubtitleOverlay {
           .sendMessage({ type: 'OPEN_OPTIONS' })
           .catch(() => undefined);
       } else if (action === 'stop') {
+        if (this.replay) {
+          stopReplay();
+          return;
+        }
         this.setStatus({ phase: 'idle', message: '正在停止…' });
         void chrome.runtime
           .sendMessage({ type: 'STOP_SESSION' })
@@ -532,6 +539,31 @@ class SubtitleOverlay {
     this.scheduleHide();
   }
 
+  setReplay(replay: boolean): void {
+    if (this.replay === replay) return;
+    this.replay = replay;
+    this.renderCurrent();
+  }
+
+  showCue(segment: CaptionSegment): void {
+    this.current = { ...segment };
+    this.stage.classList.remove('is-hidden');
+    this.renderCurrent();
+  }
+
+  hideCue(): void {
+    this.current = null;
+    this.originalEl.textContent = '';
+    this.translationEl.textContent = '';
+    this.originalEl.classList.add('is-hidden');
+    this.translationEl.classList.add('is-hidden');
+    this.caps.classList.add('is-hidden', 'no-lines');
+  }
+
+  hideStage(): void {
+    this.stage.classList.add('is-hidden');
+  }
+
   clearSegment(): void {
     this.current = null;
     this.originalEl.textContent = '';
@@ -565,15 +597,19 @@ class SubtitleOverlay {
     let title = '';
     if (showTranslation) {
       if (!translation) {
-        if (segment.status === 'error') {
-          translationText = segment.error ? '翻译失败' : '翻译失败';
-          extraClass = 'warning';
-          title = segment.error || '翻译失败';
-        } else if (segment.status === 'pending' || segment.status === 'translating') {
-          translationText = '翻译中…';
-          extraClass = 'placeholder';
+        if (!this.replay) {
+          if (segment.status === 'error') {
+            translationText = '翻译失败';
+            extraClass = 'warning';
+            title = segment.error || '翻译失败';
+          } else if (segment.status === 'pending' || segment.status === 'translating') {
+            translationText = '翻译中…';
+            extraClass = 'placeholder';
+          }
+        } else {
+          translationText = '';
         }
-      } else if (segment.status === 'error') {
+      } else if (segment.status === 'error' && !this.replay) {
         extraClass = 'warning';
         title = segment.error || '';
       }
@@ -635,9 +671,9 @@ class SubtitleOverlay {
 let overlay: SubtitleOverlay | null = null;
 let settings: AppSettings = structuredClone(DEFAULT_SETTINGS);
 let active = false;
-let anchored = false;
 let watchdog: number | null = null;
-let retryTimer: number | null = null;
+let anchorTimer: number | null = null;
+let anchorVideo: HTMLVideoElement | null = null;
 
 function ensureOverlay(): SubtitleOverlay {
   if (!overlay) overlay = new SubtitleOverlay(settings);
@@ -686,28 +722,68 @@ function findBestVideo(): HTMLVideoElement | null {
   return best;
 }
 
-function sendAnchorIfPossible(): void {
-  if (!active || anchored) return;
-  const video = findBestVideo();
-  if (!video || !Number.isFinite(video.currentTime)) return;
-  anchored = true;
+function postAnchor(seek = false): void {
+  if (!active) return;
+  const video = anchorVideo;
+  if (!video || !video.isConnected || !Number.isFinite(video.currentTime)) return;
   void chrome.runtime
-    .sendMessage({ type: 'VIDEO_ANCHOR', videoTime: video.currentTime })
+    .sendMessage({
+      type: 'VIDEO_ANCHOR',
+      videoTime: video.currentTime,
+      at: Date.now(),
+      paused: video.paused,
+      rate: video.playbackRate,
+      ...(seek ? { seek: true } : {}),
+    })
     .catch(() => undefined);
 }
 
-function scheduleAnchorRetry(): void {
-  if (retryTimer) window.clearInterval(retryTimer);
-  let attempts = 0;
-  retryTimer = window.setInterval(() => {
-    attempts++;
-    sendAnchorIfPossible();
-    if (anchored || !active || attempts > 20) {
-      if (retryTimer) window.clearInterval(retryTimer);
-      retryTimer = null;
-    }
-  }, 1500);
-  sendAnchorIfPossible();
+const onAnchorSeeked = () => postAnchor(true);
+const onAnchorPause = () => postAnchor();
+const onAnchorPlay = () => postAnchor();
+const onAnchorRateChange = () => postAnchor();
+const onAnchorEnded = () => postAnchor();
+
+function detachAnchorListeners(): void {
+  const video = anchorVideo;
+  if (!video) return;
+  video.removeEventListener('seeked', onAnchorSeeked);
+  video.removeEventListener('pause', onAnchorPause);
+  video.removeEventListener('play', onAnchorPlay);
+  video.removeEventListener('ratechange', onAnchorRateChange);
+  video.removeEventListener('ended', onAnchorEnded);
+}
+
+function ensureAnchorVideo(): void {
+  if (!active) return;
+  const video = findBestVideo();
+  if (video === anchorVideo) return;
+  detachAnchorListeners();
+  anchorVideo = video;
+  if (!video) return;
+  video.addEventListener('seeked', onAnchorSeeked);
+  video.addEventListener('pause', onAnchorPause);
+  video.addEventListener('play', onAnchorPlay);
+  video.addEventListener('ratechange', onAnchorRateChange);
+  video.addEventListener('ended', onAnchorEnded);
+  postAnchor();
+}
+
+function startAnchorTracking(): void {
+  if (anchorTimer) return;
+  ensureAnchorVideo();
+  anchorTimer = window.setInterval(() => {
+    if (!active) return;
+    if (!anchorVideo || !anchorVideo.isConnected) ensureAnchorVideo();
+    postAnchor();
+  }, 1000);
+}
+
+function stopAnchorTracking(): void {
+  if (anchorTimer) window.clearInterval(anchorTimer);
+  anchorTimer = null;
+  detachAnchorListeners();
+  anchorVideo = null;
 }
 
 function startWatchdog(): void {
@@ -715,15 +791,175 @@ function startWatchdog(): void {
   watchdog = window.setInterval(() => {
     if (!overlay || !active) return;
     overlay.keepAttached();
-    sendAnchorIfPossible();
+    ensureAnchorVideo();
   }, 2500);
 }
 
 function stopWatchdog(): void {
   if (watchdog) window.clearInterval(watchdog);
   watchdog = null;
-  if (retryTimer) window.clearInterval(retryTimer);
-  retryTimer = null;
+}
+
+const REPLAY_FLAG = 'transub-replay-available';
+const REPLAY_TICK_MS = 200;
+const REPLAY_VIDEO_RESCAN_MS = 2000;
+
+interface ReplayCue {
+  segment: CaptionSegment;
+  start: number;
+  end: number;
+}
+
+let replayCues: ReplayCue[] = [];
+let replayTimer: number | null = null;
+let replayVideo: HTMLVideoElement | null = null;
+let replayVideoScannedAt = 0;
+let replayCueId = '';
+let replayLoading = false;
+
+function pageKey(): string {
+  return `${location.origin}${location.pathname}${location.search}`;
+}
+
+function markReplayAvailable(): void {
+  try {
+    sessionStorage.setItem(REPLAY_FLAG, pageKey());
+  } catch {
+    // storage may be blocked on some pages
+  }
+}
+
+function clearReplayFlag(): void {
+  try {
+    sessionStorage.removeItem(REPLAY_FLAG);
+  } catch {
+    // ignore
+  }
+}
+
+function replayAvailable(): boolean {
+  try {
+    const stored = sessionStorage.getItem(REPLAY_FLAG);
+    if (!stored) return false;
+    if (stored === pageKey()) return true;
+    sessionStorage.removeItem(REPLAY_FLAG);
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function findCueAt(time: number): ReplayCue | null {
+  let low = 0;
+  let high = replayCues.length - 1;
+  let index = -1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (replayCues[mid].start <= time) {
+      index = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  // 从最近开始的字幕向前找覆盖当前时间的条目，回看后重复识别产生的重叠优先取较新的
+  for (let i = index; i >= 0 && i > index - 40; i--) {
+    const cue = replayCues[i];
+    if (cue.end > time) return cue;
+  }
+  return null;
+}
+
+function paintReplayCue(cue: ReplayCue | null): void {
+  const id = cue?.segment.id || '';
+  if (id === replayCueId) return;
+  replayCueId = id;
+  if (!overlay) return;
+  if (cue) overlay.showCue(cue.segment);
+  else overlay.hideCue();
+}
+
+function tickReplay(): void {
+  if (active || !replayCues.length) {
+    stopReplay();
+    return;
+  }
+  const now = Date.now();
+  if (
+    !replayVideo ||
+    !replayVideo.isConnected ||
+    now - replayVideoScannedAt >= REPLAY_VIDEO_RESCAN_MS
+  ) {
+    if (!replayVideo && now - replayVideoScannedAt < REPLAY_VIDEO_RESCAN_MS) {
+      paintReplayCue(null);
+      return;
+    }
+    replayVideoScannedAt = now;
+    const nextVideo = findBestVideo();
+    if (nextVideo !== replayVideo) {
+      replayVideo = nextVideo;
+      replayCueId = '';
+    }
+  }
+  const video = replayVideo;
+  if (!video || !Number.isFinite(video.currentTime)) {
+    paintReplayCue(null);
+    return;
+  }
+  paintReplayCue(findCueAt(video.currentTime));
+}
+
+async function startReplay(): Promise<void> {
+  if (active || replayTimer || replayLoading) return;
+  replayLoading = true;
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      type: 'GET_REPLAY_CUES',
+    })) as ReplayCuesResponse | undefined;
+    if (!response?.ok || !response.segments.length || active) return;
+    const cues = response.segments
+      .map((segment) => ({
+        segment,
+        ...segmentRange(segment, response.baseTime),
+      }))
+      .filter(
+        (cue) =>
+          !!(cue.segment.original.trim() || cue.segment.translation.trim()) &&
+          cue.end > cue.start,
+      )
+      .sort((a, b) => a.start - b.start || a.end - b.end);
+    if (!cues.length) return;
+
+    replayCues = cues;
+    replayVideo = null;
+    replayVideoScannedAt = 0;
+    replayCueId = '';
+    const view = ensureOverlay();
+    view.setReplay(true);
+    view.setActive(true);
+    view.hideCue();
+    view.setStatus({ phase: 'idle', message: '回放已生成字幕' });
+    replayTimer = window.setInterval(tickReplay, REPLAY_TICK_MS);
+    tickReplay();
+  } catch {
+    // background may have been reloaded
+  } finally {
+    replayLoading = false;
+  }
+}
+
+function stopReplay(clearFlag = true): void {
+  if (replayTimer) window.clearInterval(replayTimer);
+  replayTimer = null;
+  replayCues = [];
+  replayCueId = '';
+  replayVideo = null;
+  replayVideoScannedAt = 0;
+  if (clearFlag) clearReplayFlag();
+  if (!overlay) return;
+  overlay.setReplay(false);
+  overlay.hideCue();
+  if (!active) overlay.hideStage();
 }
 
 async function refreshState(): Promise<void> {
@@ -733,16 +969,21 @@ async function refreshState(): Promise<void> {
     })) as StateResponse | undefined;
     if (!response) return;
     active = !!response.session?.active && response.isCurrentTab;
-    if (!active) return;
+    if (!active) {
+      if (response.session && response.isCurrentTab && replayAvailable()) {
+        void startReplay();
+      }
+      return;
+    }
+    markReplayAvailable();
     const view = ensureOverlay();
     view.setActive(true);
     view.setStatus(response.session!.status);
     if (response.session!.latestSegment) {
       view.restoreSegment(response.session!.latestSegment);
     }
-    anchored = false;
     startWatchdog();
-    scheduleAnchorRetry();
+    startAnchorTracking();
   } catch {
     // extension context may have been reloaded
   }
@@ -752,15 +993,16 @@ function handleContentEvent(message: ContentEvent): void {
   if (message.type === 'SESSION_STARTED') {
     const wasActive = active;
     active = true;
+    markReplayAvailable();
     if (!wasActive) {
+      stopReplay(false);
       overlay?.clearSegment();
-      anchored = false;
     }
     const view = ensureOverlay();
     view.setActive(true);
     view.setStatus(message.status);
     startWatchdog();
-    scheduleAnchorRetry();
+    startAnchorTracking();
     return;
   }
   if (message.type === 'SESSION_STATUS') {
@@ -785,9 +1027,11 @@ function handleContentEvent(message: ContentEvent): void {
   }
   if (message.type === 'SESSION_STOPPED') {
     active = false;
-    anchored = false;
     stopWatchdog();
+    stopAnchorTracking();
     overlay?.handleStopped();
+    markReplayAvailable();
+    void startReplay();
   }
 }
 

@@ -1,4 +1,5 @@
 import type { CaptionSegment, ExportContent, ExportFormat, ExportOptions } from './types';
+import { segmentRange } from './timeline';
 
 function splitTime(seconds: number) {
   const totalMs = Math.max(0, Math.round(seconds * 1000));
@@ -49,27 +50,27 @@ export function buildSubtitleFile(
   segments: CaptionSegment[],
   options: BuildSubtitleOptions,
 ): string {
-  const base = Math.max(0, options.baseTime || 0);
   const usable = segments
     .filter((segment) => cueLines(segment, options.content).length > 0)
-    .slice()
-    .sort((a, b) => a.start - b.start);
+    .map((segment) => ({
+      segment,
+      range: segmentRange(segment, options.baseTime),
+    }))
+    .sort((a, b) => a.range.start - b.range.start || a.segment.start - b.segment.start);
 
   if (options.format === 'txt') {
-    return buildTxt(usable, options, base);
+    return buildTxt(usable, options);
   }
 
   let output = options.format === 'vtt' ? 'WEBVTT\n\n' : '';
   let index = 1;
-  for (const segment of usable) {
-    const start = base + segment.start;
-    const end = Math.max(start + 0.4, base + segment.end);
+  for (const { segment, range } of usable) {
     const lines = cueLines(segment, options.content);
     if (options.format === 'srt') {
-      output += `${index}\n${formatSrtTime(start)} --> ${formatSrtTime(end)}\n`;
+      output += `${index}\n${formatSrtTime(range.start)} --> ${formatSrtTime(range.end)}\n`;
       output += `${lines.join('\n')}\n\n`;
     } else {
-      output += `${formatVttTime(start)} --> ${formatVttTime(end)}\n`;
+      output += `${formatVttTime(range.start)} --> ${formatVttTime(range.end)}\n`;
       output += `${lines.map(escapeVtt).join('\n')}\n\n`;
     }
     index++;
@@ -78,16 +79,15 @@ export function buildSubtitleFile(
 }
 
 function buildTxt(
-  segments: CaptionSegment[],
+  cues: Array<{ segment: CaptionSegment; range: { start: number; end: number } }>,
   options: BuildSubtitleOptions,
-  base: number,
 ): string {
   const blocks: string[] = [];
-  for (const segment of segments) {
+  for (const { segment, range } of cues) {
     const lines = cueLines(segment, options.content);
     if (!lines.length) continue;
     const text = options.timestamps
-      ? `[${formatClock(base + segment.start)}] ${lines.join('\n')}`
+      ? `[${formatClock(range.start)}] ${lines.join('\n')}`
       : lines.join('\n');
     blocks.push(text);
   }

@@ -14,6 +14,8 @@ interface StreamChatOptions {
   maxTokens?: number;
   signal?: AbortSignal;
   onText?: (textSoFar: string) => void;
+  /** 批量翻译需要完整结果再按编号拆分，默认流式 */
+  stream?: boolean;
 }
 
 function withTimeout(signal: AbortSignal | undefined, ms: number): AbortSignal {
@@ -158,7 +160,7 @@ export async function streamChatCompletion(options: StreamChatOptions): Promise<
   const body: Record<string, unknown> = {
     model: model.trim(),
     messages,
-    stream: true,
+    stream: options.stream !== false,
     temperature: Math.min(2, Math.max(0, options.temperature ?? 0.2)),
   };
   if (options.maxTokens && options.maxTokens > 0) body.max_tokens = options.maxTokens;
@@ -252,26 +254,44 @@ export interface TranslateParams {
   onText?: (textSoFar: string) => void;
 }
 
-export function buildTranslationMessages(
-  params: Pick<TranslateParams, 'text' | 'targetInstruction' | 'context'> & {
-    customPrompt: string;
-  },
-): ChatMessage[] {
-  const { text, targetInstruction, context, customPrompt } = params;
+interface SystemPromptParams {
+  targetInstruction: string;
+  context: Array<{ original: string; translation: string }>;
+  customPrompt: string;
+  batchCount?: number;
+}
+
+function buildTranslationSystemPrompt(params: SystemPromptParams): string {
+  const { targetInstruction, context, customPrompt, batchCount } = params;
   const recent = context
     .filter((item) => item.original.trim() && item.translation.trim())
     .slice(-4)
     .map((item) => `原文：${item.original}\n译文：${item.translation}`)
     .join('\n---\n');
 
+  const rules = batchCount
+    ? [
+        `必须输出 ${batchCount} 行，每行格式为「编号. 译文」，编号与输入一一对应，不要合并、遗漏或改序。`,
+        '只输出编号和译文，不要输出原文、解释、引号、Markdown 代码块或空行。',
+        '每条译文保持单行，不要换行。',
+        '表达自然、口语化，符合影视对白习惯；保留人名、数字和专有名词。',
+        '原文可能是语音识别产生的不完整句子，请按最合理的语义翻译，不要遗漏信息。',
+        '如果某条原文已经是目标语言，原样输出该条。',
+      ]
+    : [
+        '只输出译文本身，不要解释、不要加引号、不要重复原文。',
+        '表达自然、口语化，符合影视对白习惯；保留人名、数字和专有名词。',
+        '原文可能是语音识别产生的不完整句子，请按最合理的语义翻译，不要遗漏信息。',
+        '如果原文已经是目标语言，原样输出。',
+      ];
+
   let system = [
     '你是专业的影视字幕翻译引擎，正在为实时播放的视频生成双语句幕。',
-    `请把用户给出的字幕翻译成：${targetInstruction}。`,
+    batchCount
+      ? `用户会给出 ${batchCount} 条编号的字幕原文，请逐条翻译成：${targetInstruction}。`
+      : `请把用户给出的字幕翻译成：${targetInstruction}。`,
     '规则：',
-    '1. 只输出译文本身，不要解释、不要加引号、不要重复原文。',
-    '2. 表达自然、口语化，符合影视对白习惯；保留人名、数字和专有名词。',
-    '3. 原文可能是语音识别产生的不完整句子，请按最合理的语义翻译，不要遗漏信息。',
-    '4. 如果原文已经是目标语言，原样输出。',
+    ...rules.map((rule, index) => `${index + 1}. ${rule}`),
   ].join('\n');
 
   if (recent) {
@@ -280,10 +300,24 @@ export function buildTranslationMessages(
   if (customPrompt.trim()) {
     system += `\n\n附加要求：${customPrompt.trim()}`;
   }
+  return system;
+}
 
+export function buildTranslationMessages(
+  params: Pick<TranslateParams, 'text' | 'targetInstruction' | 'context'> & {
+    customPrompt: string;
+  },
+): ChatMessage[] {
   return [
-    { role: 'system', content: system },
-    { role: 'user', content: text },
+    {
+      role: 'system',
+      content: buildTranslationSystemPrompt({
+        targetInstruction: params.targetInstruction,
+        context: params.context,
+        customPrompt: params.customPrompt,
+      }),
+    },
+    { role: 'user', content: params.text },
   ];
 }
 
@@ -304,6 +338,150 @@ export async function translateText(params: TranslateParams): Promise<string> {
     signal: params.signal,
     onText: params.onText,
   });
+}
+
+export interface BatchTranslationItem {
+  id: string;
+  text: string;
+}
+
+export interface BatchTranslationOutcome {
+  id: string;
+  text?: string;
+  error?: string;
+}
+
+export interface TranslateBatchParams {
+  profile: AiProfile;
+  items: BatchTranslationItem[];
+  targetInstruction: string;
+  context: Array<{ original: string; translation: string }>;
+  signal?: AbortSignal;
+  onText?: (id: string, textSoFar: string) => void;
+}
+
+export function buildBatchTranslationMessages(params: {
+  items: BatchTranslationItem[];
+  targetInstruction: string;
+  context: Array<{ original: string; translation: string }>;
+  customPrompt: string;
+}): ChatMessage[] {
+  const { items, targetInstruction, context, customPrompt } = params;
+  return [
+    {
+      role: 'system',
+      content: buildTranslationSystemPrompt({
+        targetInstruction,
+        context,
+        customPrompt,
+        batchCount: items.length,
+      }),
+    },
+    {
+      role: 'user',
+      content: items
+        .map(
+          (item, index) =>
+            `${index + 1}. ${item.text.replace(/\s*\n+\s*/g, ' ').trim()}`,
+        )
+        .join('\n'),
+    },
+  ];
+}
+
+export function parseNumberedTranslations(
+  raw: string,
+  count: number,
+): Array<string | null> {
+  const results: Array<string | null> = new Array(count).fill(null);
+  const lines = raw.replace(/\r/g, '').split('\n');
+  for (const line of lines) {
+    const match = line.match(
+      /^\s*(?:[\[（(]\s*)?(\d{1,3})\s*(?:[\]）)]\s*)?[.、:：)\]-]?\s*(.+?)\s*$/,
+    );
+    if (!match) continue;
+    const index = Number(match[1]) - 1;
+    if (index < 0 || index >= count) continue;
+    const text = match[2].trim();
+    if (text && !results[index]) results[index] = text;
+  }
+  if (results.every((item) => !item)) {
+    const plain = lines.map((line) => line.trim()).filter(Boolean);
+    if (plain.length === count) {
+      plain.forEach((line, index) => {
+        results[index] = line;
+      });
+    }
+  }
+  return results;
+}
+
+export async function translateBatch(
+  params: TranslateBatchParams,
+): Promise<BatchTranslationOutcome[]> {
+  const { profile, items, targetInstruction, context, signal, onText } = params;
+  if (!items.length) return [];
+
+  if (items.length === 1) {
+    const item = items[0];
+    try {
+      const text = await translateText({
+        profile,
+        text: item.text,
+        targetInstruction,
+        context,
+        signal,
+        onText: onText ? (textSoFar) => onText(item.id, textSoFar) : undefined,
+      });
+      return [{ id: item.id, text }];
+    } catch (error) {
+      return [{ id: item.id, error: describeError(error) }];
+    }
+  }
+
+  const raw = await streamChatCompletion({
+    baseUrl: profile.baseUrl,
+    apiKey: profile.apiKey,
+    model: profile.model,
+    temperature: profile.temperature,
+    maxTokens:
+      profile.maxTokens > 0
+        ? Math.min(4096, profile.maxTokens * items.length)
+        : undefined,
+    messages: buildBatchTranslationMessages({
+      items,
+      targetInstruction,
+      context,
+      customPrompt: profile.customPrompt,
+    }),
+    signal,
+    stream: false,
+  });
+
+  const parsed = parseNumberedTranslations(raw, items.length);
+  const outcomes: BatchTranslationOutcome[] = [];
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const text = parsed[index];
+    if (text) {
+      outcomes.push({ id: item.id, text });
+      continue;
+    }
+    // 模型偶尔会漏行或格式跑偏，缺失的条目单独补译，避免整批丢句。
+    try {
+      const fallback = await translateText({
+        profile,
+        text: item.text,
+        targetInstruction,
+        context,
+        signal,
+      });
+      outcomes.push({ id: item.id, text: fallback });
+    } catch (error) {
+      outcomes.push({ id: item.id, error: describeError(error) });
+    }
+  }
+  return outcomes;
 }
 
 export interface TestProfileResult {

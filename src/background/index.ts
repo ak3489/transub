@@ -1,4 +1,4 @@
-import { describeError, translateText } from '../shared/api';
+import { describeError, translateBatch } from '../shared/api';
 import { SESSION_KEY, getTargetInstruction } from '../shared/constants';
 import { createId, getActiveProfile, loadSettings, updateSettings } from '../shared/settings';
 import {
@@ -7,6 +7,7 @@ import {
   buildSubtitleFile,
   countExportableSegments,
 } from '../shared/subtitles';
+import { mapCaptureMsToMedia, normalizeAnchor, pushAnchor } from '../shared/timeline';
 import type {
   BackgroundRequest,
   CaptionSegment,
@@ -16,22 +17,27 @@ import type {
   OffscreenEvent,
   OffscreenRequest,
   OffscreenResponse,
+  ReplayCuesResponse,
   SessionSnapshot,
   SessionStatus,
   SessionView,
   StartCaptureResponse,
   StateResponse,
   TranslationJob,
+  VideoAnchor,
 } from '../shared/types';
 
 const OFFSCREEN_URL = 'offscreen.html';
 const MAX_SEGMENTS = 5000;
+const TRANSLATION_BATCH_SIZE = 4;
+const TRANSLATION_BATCH_CHARS = 600;
 const HANDLED_TYPES = new Set<string>([
   'START_CAPTURE',
   'STOP_CAPTURE',
   'GET_STATE',
   'CONTENT_READY',
   'VIDEO_ANCHOR',
+  'GET_REPLAY_CUES',
   'STOP_SESSION',
   'EXPORT',
   'SET_ACTIVE_PROFILE',
@@ -53,6 +59,7 @@ let currentAbort: AbortController | null = null;
 let startGeneration = 0;
 let lastStatusPersistAt = 0;
 let lastStatusPhase = '';
+let lastAnchorPersistAt = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -76,9 +83,14 @@ function normalizeStatus(raw: unknown): SessionStatus {
   };
 }
 
+function normalizeMediaTime(value: unknown): number | undefined {
+  const time = Number(value);
+  return Number.isFinite(time) && time >= 0 ? time : undefined;
+}
+
 function normalizeStoredSession(raw: unknown): SessionSnapshot | null {
   if (!raw || typeof raw !== 'object') return null;
-  const value = raw as Partial<SessionSnapshot> & { segments?: unknown };
+  const value = raw as Partial<SessionSnapshot> & { segments?: unknown; anchors?: unknown };
   const tabId = Number(value.tabId);
   if (!Number.isFinite(tabId) || tabId < 0) return null;
   const segments: CaptionSegment[] = Array.isArray(value.segments)
@@ -87,10 +99,16 @@ function normalizeStoredSession(raw: unknown): SessionSnapshot | null {
         .map((item) => {
           const seg = item as Partial<CaptionSegment>;
           const start = Math.max(0, Number(seg.start) || 0);
+          const mediaStart = normalizeMediaTime(seg.mediaStart);
+          const mediaEnd = normalizeMediaTime(seg.mediaEnd);
           return {
             id: typeof seg.id === 'string' ? seg.id : createId('seg'),
             start,
             end: Math.max(start + 0.4, Number(seg.end) || start + 1),
+            ...(mediaStart != null ? { mediaStart } : {}),
+            ...(mediaEnd != null && mediaStart != null && mediaEnd >= mediaStart
+              ? { mediaEnd }
+              : {}),
             original: typeof seg.original === 'string' ? seg.original : '',
             translation: typeof seg.translation === 'string' ? seg.translation : '',
             status: ['pending', 'translating', 'done', 'error'].includes(seg.status || '')
@@ -100,13 +118,24 @@ function normalizeStoredSession(raw: unknown): SessionSnapshot | null {
           };
         })
     : [];
+  const anchors: VideoAnchor[] = Array.isArray(value.anchors)
+    ? value.anchors
+        .map((item) => normalizeAnchor(item))
+        .filter((item): item is VideoAnchor => item != null)
+        .sort((a, b) => a.at - b.at)
+    : [];
+  const startedAt = Number(value.startedAt) || Date.now();
+  const captureEpoch = Number(value.captureEpoch);
   return {
     tabId,
-    startedAt: Number(value.startedAt) || Date.now(),
+    startedAt,
     active: !!value.active,
     title: typeof value.title === 'string' ? value.title : '未命名页面',
     baseTime: Math.max(0, Number(value.baseTime) || 0),
     baseTimeSet: !!value.baseTimeSet,
+    captureEpoch:
+      Number.isFinite(captureEpoch) && captureEpoch > 0 ? captureEpoch : startedAt,
+    anchors,
     status: normalizeStatus(value.status),
     segments,
     asrEngine: value.asrEngine === 'remote' ? 'remote' : 'local',
@@ -161,11 +190,12 @@ function persistSession(): Promise<void> {
 
 function toSessionView(snapshot: SessionSnapshot): SessionView {
   const copy = structuredClone(snapshot);
+  const { anchors: _anchors, ...rest } = copy;
   const latestSegment = copy.segments.length
     ? copy.segments[copy.segments.length - 1]
     : null;
   return {
-    ...copy,
+    ...rest,
     segments: copy.segments.slice(-3),
     segmentCount: copy.segments.length,
     latestSegment,
@@ -367,6 +397,8 @@ async function startCapture(tabId: number): Promise<StartCaptureResponse> {
     title: tab.title || '未命名页面',
     baseTime: 0,
     baseTimeSet: false,
+    captureEpoch: startedAt,
+    anchors: [],
     status: { phase: 'starting', message: '正在准备音频捕获…' },
     segments: [],
     asrEngine: settings.asr.engine,
@@ -375,6 +407,7 @@ async function startCapture(tabId: number): Promise<StartCaptureResponse> {
   hydrated = true;
   lastStatusPhase = 'starting';
   lastStatusPersistAt = Date.now();
+  lastAnchorPersistAt = 0;
   persistSession();
 
   try {
@@ -518,10 +551,31 @@ async function handleAsrSegment(
   const settings = await loadSettings();
   if (!session?.active || !matchSession(message)) return;
 
+  const mediaStartValue = mapCaptureMsToMedia(
+    message.startMs,
+    session.captureEpoch,
+    session.anchors,
+  );
+  const mediaEndValue = mapCaptureMsToMedia(
+    message.endMs,
+    session.captureEpoch,
+    session.anchors,
+  );
+  const mediaStart =
+    mediaStartValue != null && mediaEndValue != null
+      ? Math.round(mediaStartValue * 100) / 100
+      : undefined;
+  const mediaEnd =
+    mediaStart != null && mediaEndValue != null
+      ? Math.round(Math.max(mediaStart, mediaEndValue) * 100) / 100
+      : undefined;
+
   const segment: CaptionSegment = {
     id: createId('seg'),
     start,
     end,
+    ...(mediaStart != null ? { mediaStart } : {}),
+    ...(mediaEnd != null ? { mediaEnd } : {}),
     original: text,
     translation: '',
     status: settings.translation.enabled ? 'pending' : 'done',
@@ -548,44 +602,85 @@ async function pumpTranslations(): Promise<void> {
   pumping = true;
   try {
     while (jobs.length) {
-      const job = jobs[0];
       const current = await getSession();
-      if (!current || current.startedAt !== job.sessionStartedAt || !current.active) {
-        jobs.shift();
-        continue;
-      }
-      const segment = current.segments.find((item) => item.id === job.segmentId);
-      if (!segment) {
-        jobs.shift();
-        continue;
-      }
-      if (segment.status === 'error' || segment.status === 'done') {
-        jobs.shift();
-        continue;
+      if (!current || !current.active) {
+        jobs = [];
+        break;
       }
 
       const settings = await loadSettings();
       if (!settings.translation.enabled) {
-        segment.status = 'done';
-        notifyCaption(current.tabId, segment);
-        persistSession();
-        jobs.shift();
-        continue;
-      }
-      const profile = getActiveProfile(settings);
-      if (!profile) {
-        segment.status = 'error';
-        segment.error = '没有可用的 AI 配置';
-        notifyCaption(current.tabId, segment);
-        persistSession();
-        jobs.shift();
+        const affected = jobs.filter(
+          (job) => job.sessionStartedAt === current.startedAt,
+        );
+        jobs = jobs.filter((job) => job.sessionStartedAt !== current.startedAt);
+        for (const job of affected) {
+          const segment = current.segments.find(
+            (item) => item.id === job.segmentId,
+          );
+          if (!segment || segment.status === 'done' || segment.status === 'error') {
+            continue;
+          }
+          segment.status = 'done';
+          notifyCaption(current.tabId, segment);
+        }
+        if (affected.length) persistSession();
         continue;
       }
 
+      const profile = getActiveProfile(settings);
+      if (!profile) {
+        const affected = jobs.filter(
+          (job) => job.sessionStartedAt === current.startedAt,
+        );
+        jobs = jobs.filter((job) => job.sessionStartedAt !== current.startedAt);
+        for (const job of affected) {
+          const segment = current.segments.find(
+            (item) => item.id === job.segmentId,
+          );
+          if (!segment || segment.status === 'done' || segment.status === 'error') {
+            continue;
+          }
+          segment.status = 'error';
+          segment.error = '没有可用的 AI 配置';
+          notifyCaption(current.tabId, segment);
+        }
+        if (affected.length) persistSession();
+        continue;
+      }
+
+      const batch: Array<{ job: TranslationJob; segment: CaptionSegment }> = [];
+      let batchChars = 0;
+      while (jobs.length && batch.length < TRANSLATION_BATCH_SIZE) {
+        const job = jobs[0];
+        if (job.sessionStartedAt !== current.startedAt) {
+          jobs.shift();
+          continue;
+        }
+        const segment = current.segments.find(
+          (item) => item.id === job.segmentId,
+        );
+        if (!segment || segment.status === 'done' || segment.status === 'error') {
+          jobs.shift();
+          continue;
+        }
+        if (
+          batch.length &&
+          batchChars + job.text.length > TRANSLATION_BATCH_CHARS
+        ) {
+          break;
+        }
+        jobs.shift();
+        batch.push({ job, segment });
+        batchChars += job.text.length;
+      }
+      if (!batch.length) continue;
+
+      const batchIds = new Set(batch.map((entry) => entry.segment.id));
       const context = current.segments
         .filter(
           (item) =>
-            item.id !== segment.id &&
+            !batchIds.has(item.id) &&
             item.status === 'done' &&
             item.translation.trim(),
         )
@@ -596,24 +691,29 @@ async function pumpTranslations(): Promise<void> {
         settings.translation.customTarget,
       );
 
-      segment.status = 'translating';
-      delete segment.error;
-      notifyCaption(current.tabId, segment);
+      for (const { segment } of batch) {
+        segment.status = 'translating';
+        delete segment.error;
+        notifyCaption(current.tabId, segment);
+      }
       persistSession();
 
       const controller = new AbortController();
       currentAbort = controller;
       let lastUiPush = 0;
       try {
-        const translated = await translateText({
+        const outcomes = await translateBatch({
           profile,
-          text: job.text,
+          items: batch.map(({ job, segment }) => ({
+            id: segment.id,
+            text: job.text,
+          })),
           targetInstruction: target.instruction,
           context,
           signal: controller.signal,
-          onText: (textSoFar) => {
-            if (!session || session.startedAt !== job.sessionStartedAt) return;
-            const live = session.segments.find((item) => item.id === job.segmentId);
+          onText: (id, textSoFar) => {
+            if (!session || session.startedAt !== current.startedAt) return;
+            const live = session.segments.find((item) => item.id === id);
             if (!live) return;
             live.translation = textSoFar;
             const now = Date.now();
@@ -624,38 +724,57 @@ async function pumpTranslations(): Promise<void> {
           },
         });
 
-        if (session && session.startedAt === job.sessionStartedAt) {
-          const live = session.segments.find((item) => item.id === job.segmentId);
-          if (live) {
-            live.translation = translated;
-            live.status = 'done';
-            delete live.error;
+        if (session && session.startedAt === current.startedAt) {
+          let firstError = '';
+          for (const outcome of outcomes) {
+            const live = session.segments.find(
+              (item) => item.id === outcome.id,
+            );
+            if (!live) continue;
+            if (outcome.error) {
+              live.status = 'error';
+              live.error = outcome.error;
+              firstError = firstError || outcome.error;
+            } else if (outcome.text) {
+              live.translation = outcome.text;
+              live.status = 'done';
+              delete live.error;
+            } else {
+              live.status = 'error';
+              live.error = '翻译结果为空';
+              firstError = firstError || live.error;
+            }
             notifyCaption(session.tabId, live);
-            persistSession();
+          }
+          persistSession();
+          if (firstError && !controller.signal.aborted && session.active) {
+            setStatus({
+              phase: 'listening',
+              message: `翻译失败：${firstError}`,
+            });
           }
         }
       } catch (error) {
-        if (session && session.startedAt === job.sessionStartedAt) {
-          const live = session.segments.find((item) => item.id === job.segmentId);
-          if (live) {
-            live.status = 'error';
-            live.error = controller.signal.aborted
+        if (session && session.startedAt === current.startedAt) {
+          for (const { segment } of batch) {
+            if (segment.status === 'done') continue;
+            segment.status = 'error';
+            segment.error = controller.signal.aborted
               ? '已停止'
               : describeError(error);
-            notifyCaption(session.tabId, live);
-            persistSession();
-            if (!controller.signal.aborted && session.active) {
-              setStatus({
-                phase: 'listening',
-                message: `翻译失败：${live.error}`,
-              });
-            }
+            notifyCaption(session.tabId, segment);
+          }
+          persistSession();
+          if (!controller.signal.aborted && session.active) {
+            setStatus({
+              phase: 'listening',
+              message: `翻译失败：${describeError(error)}`,
+            });
           }
         }
       } finally {
         if (currentAbort === controller) currentAbort = null;
       }
-      jobs.shift();
       if (!session?.active) jobs = [];
     }
   } finally {
@@ -803,13 +922,70 @@ async function handleMessage(
       if (!current || !current.active || sender.tab?.id !== current.tabId) {
         return { ok: false };
       }
-      const videoTime = Number((message as { videoTime?: number }).videoTime);
-      if (!current.baseTimeSet && Number.isFinite(videoTime) && videoTime >= 0) {
-        current.baseTime = videoTime;
+      const payload = message as Extract<BackgroundRequest, { type: 'VIDEO_ANCHOR' }>;
+      const videoTime = Number(payload.videoTime);
+      const now = Date.now();
+      const reportedAt = Number(payload.at);
+      const anchor = normalizeAnchor({
+        at:
+          Number.isFinite(reportedAt) &&
+          reportedAt > 0 &&
+          Math.abs(now - reportedAt) < 300_000
+            ? reportedAt
+            : now,
+        videoTime,
+        paused: payload.paused,
+        rate: payload.rate,
+        seek: payload.seek,
+      });
+      if (!anchor) return { ok: false };
+
+      let baseChanged = false;
+      if (!current.baseTimeSet) {
+        current.baseTime = anchor.videoTime;
         current.baseTimeSet = true;
+        baseChanged = true;
+      }
+
+      const previous = current.anchors[current.anchors.length - 1];
+      const duplicate =
+        previous &&
+        Math.abs(previous.at - anchor.at) < 20 &&
+        Math.abs(previous.videoTime - anchor.videoTime) < 0.01 &&
+        previous.paused === anchor.paused;
+      if (!duplicate) pushAnchor(current.anchors, anchor);
+
+      if (baseChanged || anchor.seek || now - lastAnchorPersistAt > 10_000) {
+        lastAnchorPersistAt = now;
         persistSession();
       }
       return { ok: true };
+    }
+
+    case 'GET_REPLAY_CUES': {
+      const current = await getSession();
+      const tabId = Number(
+        (message as { tabId?: number }).tabId ?? sender.tab?.id ?? -1,
+      );
+      if (
+        !current ||
+        !Number.isFinite(tabId) ||
+        current.tabId !== tabId ||
+        !current.segments.length
+      ) {
+        return {
+          ok: false,
+          tabId: Number.isFinite(tabId) ? tabId : -1,
+          baseTime: 0,
+          segments: [],
+        } satisfies ReplayCuesResponse;
+      }
+      return {
+        ok: true,
+        tabId,
+        baseTime: current.baseTimeSet ? current.baseTime : 0,
+        segments: structuredClone(current.segments),
+      } satisfies ReplayCuesResponse;
     }
 
     case 'EXPORT': {
@@ -839,6 +1015,11 @@ async function handleMessage(
     case 'CAPTURE_STARTED': {
       if (!matchSession(message)) return { ok: false };
       if (session) {
+        const capturedAt = Number(message.capturedAt);
+        if (Number.isFinite(capturedAt) && capturedAt > 0) {
+          session.captureEpoch = capturedAt;
+          persistSession();
+        }
         setStatus({
           phase: 'listening',
           message:

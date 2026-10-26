@@ -1424,6 +1424,9 @@ function GeneralSection({ settings, update }: SectionProps) {
               「自动 · 中英互译」会根据原文在中英之间切换，适合两种语言混合的视频。
             </p>
           )}
+          <p className="field-hint">
+            翻译按完整优先排队：积压时自动合并请求，不主动丢句；模型较慢时译文会滞后，停止前请等「翻译中…」结束。
+          </p>
         </section>
 
         <section className="card panel">
@@ -1446,7 +1449,13 @@ function GeneralSection({ settings, update }: SectionProps) {
             </li>
             <li>
               <span className="step-num">4</span>
-              <span>在弹窗中随时停止并导出 SRT / VTT / TXT 字幕文件。</span>
+              <span>
+                停止后字幕条会切换为回放模式，跟随视频进度显示已生成字幕；拖动进度条即可回看。
+              </span>
+            </li>
+            <li>
+              <span className="step-num">5</span>
+              <span>在弹窗中随时导出 SRT / VTT / TXT 字幕文件。</span>
             </li>
           </ol>
         </section>

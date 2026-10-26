@@ -220,7 +220,7 @@ async function startCapture(
     });
     capture = cap;
     if (tabId != null && sessionId != null) {
-      post({ type: 'CAPTURE_STARTED', tabId, sessionId });
+      post({ type: 'CAPTURE_STARTED', tabId, sessionId, capturedAt: Date.now() });
     }
     if (asrConfig.engine === 'local') {
       void prepareModel();
